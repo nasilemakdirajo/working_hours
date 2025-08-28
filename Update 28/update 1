@@ -1,0 +1,327 @@
+# =======================
+# Upload the two files
+# =======================
+from google.colab import files
+print("Upload the fingerprint export (.XLS SpreadsheetML XML):")
+up1 = files.upload()
+att_name = next(iter(up1.keys()))
+att_raw = up1[att_name]
+
+print("Upload the weekly schedule matrix CSV (Name, dd/mm/yyyy ...):")
+up2 = files.upload()
+sched_csv_name = next(iter(up2.keys()))
+sched_csv_raw = up2[sched_csv_name]
+
+# =======================
+# Imports & Config
+# =======================
+import re, io
+import xml.etree.ElementTree as ET
+from datetime import date, datetime
+import pandas as pd
+
+# OUT after midnight up to 05:59 still belongs to the same shift date.
+# ≥ 06:00 belongs to the next day.
+MORNING_CUTOFF_MIN = 6*60   # 06:00
+
+# Attendance grid layout from the machine export:
+LEFT_WIDTH = 8              # Date, Week, then 6 time cells (IN/OUT x3)
+RIGHT_OFFSET = 8            # the right-hand date/week block starts here
+DEFAULT_YEAR = 2025
+
+OUT_CSV = "attendance_with_ot.csv"
+
+# --- Shift catalog (edit/extend as you wish) ---
+SHIFT_MAP = {
+    "S1":  ("10:00","19:00"),  # Mon–Thu examples
+    "S2":  ("15:00","00:00"),
+    "S3":  ("11:00","20:00"),
+    "S4":  ("12:00","21:00"),
+    "S5":  ("15:00","00:00"),  # Fri
+    "S6":  ("12:00","21:00"),
+    "S7":  ("07:00","16:00"),  # Sat–Sun examples
+    "S8":  ("08:00","17:00"),
+    "S9":  ("09:00","18:00"),
+    "S10": ("14:00","23:00"),
+    # leave codes
+    "OFF": (None, None),
+    "AL":  (None, None),
+}
+
+# =======================
+# SpreadsheetML helpers
+# =======================
+def sniff_xml_encoding(b: bytes) -> str:
+    head = b[:200].decode("ascii", errors="ignore")
+    m = re.search(r'encoding\s*=\s*["\']([^"\']+)["\']', head, re.I)
+    enc = (m.group(1).lower() if m else "utf-8")
+    return {
+        "utf-16":"utf-16","utf16":"utf-16",
+        "utf-16le":"utf-16le","utf16le":"utf-16le",
+        "utf-16be":"utf-16be","utf16be":"utf-16be",
+        "utf-8":"utf-8-sig","utf8":"utf-8-sig",
+        "gb2312":"gb18030","gbk":"gb18030","gb18030":"gb18030",
+    }.get(enc, enc)
+
+def read_spreadsheetml_grid(raw: bytes):
+    enc = sniff_xml_encoding(raw)
+    text = raw.decode(enc, errors="replace")
+    ns = {"ss":"urn:schemas-microsoft-com:office:spreadsheet"}
+    root = ET.fromstring(text)
+    ws = root.find(".//ss:Worksheet", ns)
+    table = ws.find(".//ss:Table", ns)
+    grid = []
+    for r in table.findall("ss:Row", ns):
+        row, cidx = [], 1
+        for c in r.findall("ss:Cell", ns):
+            idx_attr = c.get("{urn:schemas-microsoft-com:office:spreadsheet}Index")
+            if idx_attr:
+                idx = int(idx_attr)
+                while cidx < idx:
+                    row.append("")
+                    cidx += 1
+            d = c.find("ss:Data", ns)
+            txt = "" if d is None or d.text is None else str(d.text)
+            row.append(txt); cidx += 1
+        grid.append(row)
+    return grid, text
+
+def find_dual_header_row(grid, start=0):
+    for i in range(start, len(grid)):
+        r = [str(x).strip() for x in grid[i]]
+        if len(r) >= LEFT_WIDTH+RIGHT_OFFSET and r[0]=="Date" and r[1]=="Week" \
+           and r[RIGHT_OFFSET]=="Date" and r[RIGHT_OFFSET+1]=="Week":
+            return i
+    return None
+
+def year_hint_from_text(txt:str)->int:
+    m = re.search(r"Date:(\d{2})\.\d{2}\.\d{2}", txt)
+    return 2000 + int(m.group(1)) if m else DEFAULT_YEAR
+
+def clean_time(s):
+    if s is None: return ""
+    s = str(s).strip().replace("\u3000"," ").replace("\u00A0"," ")
+    for ch in ("：","，","．",",","."):
+        s = s.replace(ch, ":")
+    return s
+
+PLUS_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*\+\s*(\d{1,2}):(\d{2})\s*$")
+
+def parse_time_to_min(s):
+    s = clean_time(s)
+    if not s: return None
+    m = PLUS_RE.match(s)
+    if m:
+        h1,m1,h2,m2 = map(int, m.groups())
+        return (h1%24)*60 + (m1%60) + (h2*60+m2)
+    if ":" not in s: return None
+    try:
+        h,m = s.split(":",1); h=int(h); m=int(m)
+        return (h%24)*60 + (m%60)
+    except: return None
+
+def take_block_row(row, base):
+    vals = row + [""]*(base+LEFT_WIDTH-len(row))
+    return {
+        "Date": vals[base+0].strip(),
+        "Week": vals[base+1].strip(),
+        "Times": [vals[base+j].strip() for j in range(2, LEFT_WIDTH)]
+    }
+
+def mmdd_to_date(mmdd, year_hint):
+    s = (mmdd or "").strip()
+    if not s: return None
+    if "." in s: mm, dd = s.split(".",1)
+    elif "/" in s: mm, dd = s.split("/",1)
+    else: return None
+    try: return date(year_hint, int(mm), int(dd))
+    except: return None
+
+def date_to_str(d:date): return f"{d.day:02d}/{d.month:02d}/{d.year:04d}"
+
+# =======================
+# Time-pick logic (updated)
+# =======================
+def earliest_in(times6):
+    """
+    First valid IN for the shift date.
+    Any IN stamped after midnight but before 06:00 belongs to NEXT day,
+    so push it to +24h to avoid being picked for the current shift date.
+    """
+    ins = []
+    for i in (0, 2, 4):  # Morning IN, Afternoon IN, Overtime IN
+        t = parse_time_to_min(times6[i])
+        if t is None: 
+            continue
+        if 0 < t < MORNING_CUTOFF_MIN:
+            t += 1440  # 00:01–05:59 → next day
+        ins.append(t)
+    return min(ins) if ins else None
+
+def latest_out(times6):
+    """
+    Last valid OUT for the shift date.
+    - 00:00 means 24:00 (same day end)
+    - 00:01–05:59 count as 'after midnight but still same shift date'
+      (add +24h so durations cross midnight correctly).
+    """
+    outs = []
+    for i in (1, 3, 5):  # Morning OUT, Afternoon OUT, Overtime OUT
+        t = parse_time_to_min(times6[i])
+        if t is None:
+            continue
+        if t == 0:
+            outs.append(1440)                      # 00:00 → 24:00
+        elif 0 < t < MORNING_CUTOFF_MIN:
+            outs.append(t + 1440)                  # 00:01–05:59 → +24h
+        else:
+            outs.append(t)
+    return max(outs) if outs else None
+
+def hhmm(total_min):
+    if total_min is None: return ""
+    h, m = divmod(total_min, 60)
+    return f"{h}:{m:02d}"
+
+# =======================
+# Parse attendance file (all employees)
+# =======================
+grid, raw_text = read_spreadsheetml_grid(att_raw)
+rows_att = []
+i = 0
+while i < len(grid):
+    hdr = find_dual_header_row(grid, i)
+    if hdr is None: break
+
+    name = "UNKNOWN"
+    year_hint = year_hint_from_text(raw_text)
+    # scan near header to find Name and Year
+    for k in range(max(0, hdr-8), hdr+1):
+        for cell in [str(x) for x in grid[k]]:
+            if cell.startswith("Name:"):
+                name = cell.split("Name:",1)[1].strip()
+            if cell.startswith("Date:"):
+                m = re.search(r"Date:(\d{2})\.\d{2}\.\d{2}", cell)
+                if m: year_hint = 2000 + int(m.group(1))
+
+    r = hdr + 1
+    person_rows = []
+    while r < len(grid):
+        row = [str(x) if x is not None else "" for x in grid[r]]
+        left = take_block_row(row, 0)
+        right = take_block_row(row, RIGHT_OFFSET)
+        if not left["Date"] and not right["Date"]:
+            r += 1; break
+        if left["Date"]:
+            dt = mmdd_to_date(left["Date"], year_hint)
+            person_rows.append((name, dt, left["Week"], left["Times"]))
+        if right["Date"]:
+            dt = mmdd_to_date(right["Date"], year_hint)
+            person_rows.append((name, dt, right["Week"], right["Times"]))
+        r += 1
+
+    # keep sorted by date
+    for nm, dt, wk, times6 in sorted([p for p in person_rows if p[1] is not None], key=lambda x:x[1]):
+        rows_att.append({"Name": nm, "Date": dt, "Week": wk, "Times": times6})
+
+    i = r + 1
+
+# =======================
+# Parse weekly schedule matrix CSV
+#   Col A header: Name
+#   Col B.. headers: dd/mm/yyyy (or include weekday label, last token must be dd/mm/yyyy)
+#   Body: shift codes (S1..S10, OFF, AL)
+# =======================
+sched_df = pd.read_csv(io.StringIO(sched_csv_raw.decode("utf-8-sig")), header=0, dtype=str).fillna("")
+if sched_df.columns[0].strip().lower() != "name":
+    raise ValueError("First column header in schedule CSV must be 'Name'.")
+
+date_cols = []
+for c in sched_df.columns[1:]:
+    txt = c.strip()
+    try:
+        d = datetime.strptime(txt, "%d/%m/%Y").date()
+        date_cols.append((c, d))
+    except:
+        # allow headers like "Mon 01/09/2025"
+        last = txt.split()[-1]
+        d = datetime.strptime(last, "%d/%m/%Y").date()
+        date_cols.append((c, d))
+
+schedule = {}
+for _, row in sched_df.iterrows():
+    nm = row.iloc[0].strip()
+    if not nm: continue
+    for idx, (hdr, d) in enumerate(date_cols, start=1):
+        code = str(row.iloc[idx]).strip().upper()
+        if code:
+            schedule[(nm, d)] = code
+
+# =======================
+# Calculate Worked & OT
+# =======================
+records = []
+for r in rows_att:
+    nm, dt, wk, times6 = r["Name"], r["Date"], r["Week"], r["Times"]
+
+    # First IN / Last OUT using updated rules
+    in_min  = earliest_in(times6)
+    out_min = latest_out(times6)
+
+    worked = None
+    if in_min is not None and out_min is not None:
+        worked = out_min - in_min
+        if worked < 0: worked += 1440
+
+    code = schedule.get((nm, dt), "")
+    sched_start = sched_end = None
+    ot_early = ot_late = 0
+
+    if code and code in SHIFT_MAP:
+        st, en = SHIFT_MAP[code]
+        if st:                 # scheduled day (not OFF/AL)
+            s = parse_time_to_min(st)
+            e = parse_time_to_min(en)
+            if e == 0: e = 1440      # 00:00 is 24:00 same day
+            sched_start, sched_end = s, e
+
+        # OT rule: each side must reach >= 1 hour independently
+        if worked is not None and sched_start is not None and sched_end is not None:
+            early = max(0, sched_start - (in_min or sched_start))
+            late  = max(0, (out_min or sched_end) - sched_end)
+            ot_early = early if early >= 60 else 0
+            ot_late  = late  if late  >= 60 else 0
+    # OFF/AL/no-code => no OT
+
+    records.append({
+        "Name": nm,
+        "Date": date_to_str(dt),  # dd/mm/yyyy
+        "Week": wk,
+        "Shift": code,
+        "Sched_Start": "" if sched_start is None else hhmm(sched_start),
+        "Sched_End": "" if sched_end is None else hhmm(sched_end),
+        "Morning (IN)": times6[0],
+        "Morning (OUT)": times6[1],
+        "Afternoon (IN)": times6[2],
+        "Afternoon (OUT)": times6[3],
+        "Overtime (IN)": times6[4],
+        "Overtime (OUT)": times6[5],
+        "First_IN": "" if in_min is None else hhmm(in_min),
+        "Last_OUT": "" if out_min is None else hhmm(out_min),
+        "Worked_hh:mm": "" if worked is None else hhmm(worked),
+        "OT_Early_hh:mm": hhmm(ot_early) if ot_early else "0:00",
+        "OT_Late_hh:mm":  hhmm(ot_late)  if ot_late  else "0:00",
+        "OT_Total_hh:mm": hhmm(ot_early + ot_late) if (ot_early or ot_late) else "0:00",
+    })
+
+out_df = pd.DataFrame(records, columns=[
+    "Name","Date","Week","Shift","Sched_Start","Sched_End",
+    "Morning (IN)","Morning (OUT)","Afternoon (IN)","Afternoon (OUT)",
+    "Overtime (IN)","Overtime (OUT)",
+    "First_IN","Last_OUT","Worked_hh:mm",
+    "OT_Early_hh:mm","OT_Late_hh:mm","OT_Total_hh:mm"
+])
+
+out_df.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+print(f"Done. Wrote {OUT_CSV} ({len(out_df)} rows).")
+files.download(OUT_CSV)
